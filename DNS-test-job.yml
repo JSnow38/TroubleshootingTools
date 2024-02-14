@@ -1,0 +1,22 @@
+kind: Job
+metadata:
+  name: dig-job
+spec:
+  template:
+    spec:
+      containers:
+      - name: dig
+        image: ubuntu
+        command: ["/bin/bash", "-c"]
+        args: ["apt-get update && apt-get install -y dnsutils curl && while true; do echo 'dig result for $IP1:' && dig @$IP1 $HOSTNAME && echo 'dig result for $IP2:' && dig @$IP2 $HOSTNAME && echo 'dig result for $IP3:' && dig @$IP3 $HOSTNAME && echo 'nslookup result for $HOSTNAME:' && nslookup $HOSTNAME $IP1 && echo 'curl result for $HOSTNAME:' && curl -I $HOSTNAME; sleep 10; done"]
+        env:
+        - name: IP1
+          value: "NEW_DNS_IP1"  # replace with your new DNS IP
+        - name: IP2
+          value: "NEW_DNS_IP2"  # replace with your new DNS IP
+        - name: IP3
+          value: "NEW_DNS_IP3"  # replace with your new DNS IP
+        - name: HOSTNAME
+          value: "NEW_HOSTNAME"  # replace with your hostname
+      restartPolicy: OnFailure
+  backoffLimit: 4

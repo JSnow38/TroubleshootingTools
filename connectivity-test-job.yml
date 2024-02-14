@@ -1,0 +1,19 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: conn-job
+spec:
+  template:
+    spec:
+      containers:
+      - name: netcat-test
+        image: ubuntu
+        command: ["/bin/bash", "-c"]
+        args: ["apt-get update && apt-get install -y netcat && while true; do echo 'Testing connectivity to $HOSTNAME on port $PORT:' && nc -vz $HOSTNAME $PORT; sleep 10; done"]
+        env:
+        - name: HOSTNAME
+          value: "NEW_HOSTNAME"  # replace with your hostname
+        - name: PORT
+          value: "80"  # replace with your desired port
+      restartPolicy: OnFailure
+  backoffLimit: 4
