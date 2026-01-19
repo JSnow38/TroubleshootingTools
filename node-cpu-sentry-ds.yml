@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-cpu-sentry
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: node-cpu-sentry
+  template:
+    metadata:
+      labels:
+        app: node-cpu-sentry
+    spec:
+      serviceAccountName: default  # no RBAC needed; adjust if your cluster restricts host access
+      hostPID: true
+      tolerations:
+        - operator: "Exists"       # schedule on all nodes, including masters/system
+      containers:
+        - name: cpu-watcher
+          image: busybox:1.36
+          securityContext:
+            privileged: true       # needed to read /proc on the host
+command:
+  - /bin/sh
+  - -c
+  - |
+    INTERVAL=30   # seconds between samples
+    THRESHOLD=90  # percent
+    get_cpu_idle() {
+      # Returns idle jiffies and total jiffies from /proc/stat
+      read _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+      total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+      echo "$idle $total"
+    }
+
+    while true; do
+      eval "$(get_cpu_idle)"
+      idle1=$idle
+      total1=$total
+      sleep "$INTERVAL"
+      eval "$(get_cpu_idle)"
+      idle2=$idle
+      total2=$total
+      idle_delta=$((idle2 - idle1))
+      total_delta=$((total2 - total1))
+      usage=$(( (100 * (total_delta - idle_delta)) / total_delta ))
+      ts=$(date -Iseconds)
+      node=$(cat /etc/hostname)
+      if [ "$usage" -ge "$THRESHOLD" ]; then
+        echo "{\"ts\":\"$ts\",\"node\":\"$node\",\"cpu_percent\":$usage,\"level\":\"warning\",\"msg\":\"Node CPU high\"}"
+      else
+        echo "{\"ts\":\"$ts\",\"node\":\"$node\",\"cpu_percent\":$usage,\"level\":\"info\",\"msg\":\"Node CPU ok\"}"
+      fi
+    done
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          volumeMounts:
+            - name: host-proc
+              mountPath: /proc
+              readOnly: true
+      volumes:
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+      nodeSelector: {}  # run everywhere
+      terminationGracePeriodSeconds: 5
