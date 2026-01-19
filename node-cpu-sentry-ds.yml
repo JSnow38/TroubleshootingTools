@@ -1,73 +1,232 @@
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: node-cpu-sentry
-  namespace: default
+  name: pod-cpu-sentry
+  namespace: kube-system
 spec:
   selector:
     matchLabels:
-      app: node-cpu-sentry
+      app: pod-cpu-sentry
   template:
     metadata:
       labels:
-        app: node-cpu-sentry
+        app: pod-cpu-sentry
     spec:
-      serviceAccountName: default  # no RBAC needed; adjust if your cluster restricts host access
       hostPID: true
+      hostNetwork: true
       tolerations:
-        - operator: "Exists"       # schedule on all nodes, including masters/system
+        - operator: "Exists"
       containers:
-        - name: cpu-watcher
-          image: busybox:1.36
+        - name: watcher
+          image: python:3.12-alpine
           securityContext:
-            privileged: true       # needed to read /proc on the host
-command:
-  - /bin/sh
-  - -c
-  - |
-    INTERVAL=30   # seconds between samples
-    THRESHOLD=90  # percent
-    get_cpu_idle() {
-      # Returns idle jiffies and total jiffies from /proc/stat
-      read _ user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
-      total=$((user + nice + system + idle + iowait + irq + softirq + steal))
-      echo "$idle $total"
-    }
-
-    while true; do
-      eval "$(get_cpu_idle)"
-      idle1=$idle
-      total1=$total
-      sleep "$INTERVAL"
-      eval "$(get_cpu_idle)"
-      idle2=$idle
-      total2=$total
-      idle_delta=$((idle2 - idle1))
-      total_delta=$((total2 - total1))
-      usage=$(( (100 * (total_delta - idle_delta)) / total_delta ))
-      ts=$(date -Iseconds)
-      node=$(cat /etc/hostname)
-      if [ "$usage" -ge "$THRESHOLD" ]; then
-        echo "{\"ts\":\"$ts\",\"node\":\"$node\",\"cpu_percent\":$usage,\"level\":\"warning\",\"msg\":\"Node CPU high\"}"
-      else
-        echo "{\"ts\":\"$ts\",\"node\":\"$node\",\"cpu_percent\":$usage,\"level\":\"info\",\"msg\":\"Node CPU ok\"}"
-      fi
-    done
+            privileged: true
+            readOnlyRootFilesystem: false
+          env:
+            - name: INTERVAL_SECONDS
+              value: "30"
+            - name: THRESHOLD_PERCENT
+              value: "70"
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir pyyaml >/dev/null 2>&1
+              python /opt/watch.py
+          volumeMounts:
+            - name: host-cgroup
+              mountPath: /host/sys/fs/cgroup
+              readOnly: true
+            - name: host-kubelet-pods
+              mountPath: /host/var/lib/kubelet/pods
+              readOnly: true
+            - name: host-proc
+              mountPath: /host/proc
+              readOnly: true
+            - name: script
+              mountPath: /opt/watch.py
+              subPath: watch.py
+              readOnly: true
           resources:
             requests:
-              cpu: 5m
-              memory: 16Mi
+              cpu: 20m
+              memory: 64Mi
             limits:
-              cpu: 50m
-              memory: 32Mi
-          volumeMounts:
-            - name: host-proc
-              mountPath: /proc
-              readOnly: true
+              cpu: 200m
+              memory: 256Mi
       volumes:
+        - name: host-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: host-kubelet-pods
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
         - name: host-proc
           hostPath:
             path: /proc
             type: Directory
-      nodeSelector: {}  # run everywhere
-      terminationGracePeriodSeconds: 5
+        - name: script
+          configMap:
+            name: pod-cpu-sentry-script
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pod-cpu-sentry-script
+  namespace: kube-system
+data:
+  watch.py: |
+    import os, re, time, json, socket
+    from datetime import datetime, timezone
+ 
+    import yaml
+ 
+    CGROUP_ROOT = "/host/sys/fs/cgroup"
+    KUBELET_PODS = "/host/var/lib/kubelet/pods"
+    HOST_PROC = "/host/proc"
+ 
+    INTERVAL = int(os.getenv("INTERVAL_SECONDS", "30"))
+    THRESHOLD = float(os.getenv("THRESHOLD_PERCENT", "70"))
+ 
+    # systemd-style pod slice names embed pod UID with underscores:
+    # kubepods-burstable-pod12345678_1234_1234_1234_1234567890ab.slice
+    POD_SLICE_RE = re.compile(r"pod([0-9a-fA-F_]{10,})\.slice$")
+ 
+    def now_iso():
+        return datetime.now(timezone.utc).isoformat()
+ 
+    def node_name():
+        # best-effort: hostname inside the pod is fine; usually equals node name only if hostNetwork/hostPID tricks are used.
+        # We'll also try to read from host /proc to avoid container hostname surprises.
+        try:
+            with open(os.path.join(HOST_PROC, "sys/kernel/hostname"), "r") as f:
+                return f.read().strip()
+        except Exception:
+            return socket.gethostname()
+ 
+    def cpu_cores():
+        # read host cpuinfo
+        try:
+            with open(os.path.join(HOST_PROC, "cpuinfo"), "r") as f:
+                return sum(1 for line in f if line.startswith("processor"))
+        except Exception:
+            return os.cpu_count() or 1
+ 
+    def read_usage_usec(p):
+        # cpu.stat in cgroup v2 includes: usage_usec, user_usec, system_usec, ...
+        try:
+            with open(os.path.join(p, "cpu.stat"), "r") as f:
+                for line in f:
+                    if line.startswith("usage_usec "):
+                        return int(line.split()[1])
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+        return None
+ 
+    def uid_from_slice_dirname(dname: str):
+        m = POD_SLICE_RE.search(dname)
+        if not m:
+            return None
+        # systemd uses underscores in place of dashes in the UID
+        return m.group(1).replace("_", "-").lower()
+ 
+    def find_pod_cgroup_dirs():
+        out = []
+        # Walk a limited depth to keep this cheap
+        for root, dirs, files in os.walk(CGROUP_ROOT):
+            # prune deep trees a bit
+            rel = os.path.relpath(root, CGROUP_ROOT)
+            if rel.count(os.sep) > 8:
+                dirs[:] = []
+                continue
+            for d in dirs:
+                if d.endswith(".slice") and "pod" in d:
+                    uid = uid_from_slice_dirname(d)
+                    if uid:
+                        out.append((uid, os.path.join(root, d)))
+        return out
+ 
+    def pod_meta(uid: str):
+        # kubelet keeps a pod.yaml under /var/lib/kubelet/pods/<uid>/pod.yaml on many distros.
+        # If not present, we fall back to UID only.
+        p = os.path.join(KUBELET_PODS, uid, "pod.yaml")
+        try:
+            with open(p, "r") as f:
+                data = yaml.safe_load(f)
+            meta = (data or {}).get("metadata") or {}
+            return {
+                "namespace": meta.get("namespace") or "unknown",
+                "pod": meta.get("name") or "unknown",
+            }
+        except Exception:
+            return {"namespace": "unknown", "pod": "unknown"}
+ 
+    def main():
+        n = node_name()
+        cores = cpu_cores()
+ 
+        # first sample
+        pods = find_pod_cgroup_dirs()
+        usage1 = {}
+        for uid, path in pods:
+            u = read_usage_usec(path)
+            if u is not None:
+                usage1[uid] = (u, path)
+ 
+        time.sleep(INTERVAL)
+ 
+        # second sample (re-scan: pods may come/go)
+        pods2 = find_pod_cgroup_dirs()
+        usage2 = {}
+        for uid, path in pods2:
+            u = read_usage_usec(path)
+            if u is not None:
+                usage2[uid] = (u, path)
+ 
+        # compute deltas for intersection
+        interval_usec = INTERVAL * 1_000_000
+        for uid, (u2, path2) in usage2.items():
+            if uid not in usage1:
+                continue
+            u1, path1 = usage1[uid]
+            delta = u2 - u1
+            if delta < 0:
+                continue
+ 
+            # CPU percent of node capacity:
+            # delta_usec / interval_usec gives "cores used" (e.g. 1.5 means 1.5 cores)
+            cores_used = delta / interval_usec
+            percent_node = (cores_used / cores) * 100.0 if cores > 0 else 0.0
+ 
+            if percent_node >= THRESHOLD:
+                meta = pod_meta(uid)
+                print(json.dumps({
+                    "ts": now_iso(),
+                    "node": n,
+                    "namespace": meta["namespace"],
+                    "pod": meta["pod"],
+                    "pod_uid": uid,
+                    "cpu_percent_of_node": round(percent_node, 2),
+                    "cpu_cores_used": round(cores_used, 3),
+                    "interval_seconds": INTERVAL,
+                    "level": "warning",
+                    "msg": "Pod CPU high"
+                }), flush=True)
+ 
+    if __name__ == "__main__":
+        while True:
+            try:
+                main()
+            except Exception as e:
+                print(json.dumps({
+                    "ts": now_iso(),
+                    "node": node_name(),
+                    "level": "error",
+                    "msg": "watch loop error",
+                    "error": str(e),
+                }), flush=True)
+                time.sleep(5)
