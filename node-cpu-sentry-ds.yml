@@ -1,3 +1,6 @@
+#This Daemonset and associated configmap will poll CPU usage on each AKS node every 30 seconds and log entries if it exceeds 90%.  
+#This is intended to aid in troubleshooting to identify the application causing CPU pressure on the node.
+
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -230,3 +233,4 @@ data:
                     "error": str(e),
                 }), flush=True)
                 time.sleep(5)
+
